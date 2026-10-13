@@ -51,8 +51,10 @@ CFG = dict(
     addon_type     = 'regular',    # 'regular' | 'bottleneck'
 
     # Training
-    batch_size     = 32,
+    batch_size     = 64,           # tăng lên 64 cho GPU throughput tốt hơn
     num_epochs     = 15,
+    train_subset   = 10000,        # dùng 10K ảnh train (None = full 50K)
+    use_amp        = True,         # AMP (mixed precision) — giảm ~50% thời gian
     lr_backbone    = 2e-5,         # nhỏ — tương tự fine-tune trong ProtoPFormer
     lr_addon       = 1e-3,
     lr_proto       = 1e-3,
@@ -432,32 +434,65 @@ def build_loaders(cfg):
     val_ds   = torchvision.datasets.CIFAR10(
         cfg['data_root'], train=False, download=True, transform=tf_val)
 
+    # ── Tùy chọn: chỉ dùng một phần dữ liệu train để chạy nhanh hơn ──────────────
+    subset_n = cfg.get('train_subset', None)
+    if subset_n is not None and subset_n < len(train_ds):
+        # Lấy đều đu train subset_n mẫu mỗi class (stratified)
+        indices_per_cls = [[] for _ in range(cfg['num_classes'])]
+        for idx, (_, lbl) in enumerate(train_ds):
+            if all(len(v) >= subset_n // cfg['num_classes'] for v in indices_per_cls):
+                break
+            if len(indices_per_cls[lbl]) < subset_n // cfg['num_classes']:
+                indices_per_cls[lbl].append(idx)
+        flat_indices = [i for sub in indices_per_cls for i in sub]
+        train_ds = Subset(train_ds, flat_indices)
+        print(f'[INFO] Train subset: {len(flat_indices):,} samples '
+              f'({subset_n // cfg["num_classes"]} per class)')
+    else:
+        print(f'[INFO] Train set: {len(train_ds):,} samples (full)')
+
     # Subset nhỏ để probe nhanh
     probe_ds = Subset(val_ds, list(range(cfg['probe_samples'])))
 
+    nw = min(4, os.cpu_count() or 2)   # num_workers tự động
     train_loader = DataLoader(train_ds, batch_size=cfg['batch_size'],
-                              shuffle=True,  num_workers=2, pin_memory=True)
+                              shuffle=True,  num_workers=nw, pin_memory=True,
+                              persistent_workers=(nw > 0))
     probe_loader = DataLoader(probe_ds, batch_size=64,
-                              shuffle=False, num_workers=2)
+                              shuffle=False, num_workers=nw,
+                              persistent_workers=(nw > 0))
     return train_loader, probe_loader, val_ds
 
 # ─────────────────────────────────────────────
 # 6.  TRAINING LOOP
 # ─────────────────────────────────────────────
-def train_one_epoch(model, loader, optimizer, criterion, device, epoch):
+def train_one_epoch(model, loader, optimizer, criterion, device, epoch, scaler=None):
+    """
+    scaler != None → dùng AMP (torch.cuda.amp) — giảm ~50% thời gian trên GPU.
+    """
     model.train()
     total_loss = 0.
     correct    = 0
     total      = 0
+    use_amp = (scaler is not None) and (device.type == 'cuda')
     for imgs, labels in tqdm(loader, desc=f'Epoch {epoch}', leave=False):
-        imgs, labels = imgs.to(device), labels.to(device)
+        imgs, labels = imgs.to(device, non_blocking=True), labels.to(device, non_blocking=True)
         optimizer.zero_grad()
-        logits, _ = model(imgs)
-        loss = criterion(logits, labels)
-        loss.backward()
-        # Gradient clipping để tránh exploding
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
+        if use_amp:
+            with torch.cuda.amp.autocast():
+                logits, _ = model(imgs)
+                loss = criterion(logits, labels)
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            logits, _ = model(imgs)
+            loss = criterion(logits, labels)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
         total_loss += loss.item() * imgs.size(0)
         correct    += (logits.argmax(1) == labels).sum().item()
         total      += imgs.size(0)
@@ -497,12 +532,19 @@ def get_device(override: str = None) -> torch.device:
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='Proto-Background Attraction Probe')
-    parser.add_argument('--device',     type=str, default='',
-                        help='Force device: cuda | cpu | cuda:0 (default: auto-detect)')
-    parser.add_argument('--epochs',     type=int, default=CFG['num_epochs'])
-    parser.add_argument('--batch_size', type=int, default=CFG['batch_size'])
-    parser.add_argument('--save_dir',   type=str, default=CFG['save_dir'])
+    parser = argparse.ArgumentParser(
+        description='Proto-Background Attraction Probe',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    parser.add_argument('--device',       type=str,  default='',
+                        help='Force device: cuda | cpu | cuda:0')
+    parser.add_argument('--epochs',       type=int,  default=CFG['num_epochs'])
+    parser.add_argument('--batch_size',   type=int,  default=CFG['batch_size'])
+    parser.add_argument('--train_subset', type=int,  default=CFG.get('train_subset', 10000),
+                        help='Số ảnh train (None=50K full, 10000=~8-12 phút trên T4)')
+    parser.add_argument('--no_amp',       action='store_true',
+                        help='Tắt AMP (mặc định bật)')
+    parser.add_argument('--save_dir',     type=str,  default=CFG['save_dir'])
     return parser.parse_args()
 
 
@@ -510,23 +552,34 @@ def main():
     args   = parse_args()
     cfg    = CFG.copy()
     # Override từ CLI
-    cfg['num_epochs'] = args.epochs
-    cfg['batch_size'] = args.batch_size
-    cfg['save_dir']   = args.save_dir
+    cfg['num_epochs']   = args.epochs
+    cfg['batch_size']   = args.batch_size
+    cfg['train_subset'] = args.train_subset
+    cfg['use_amp']      = not args.no_amp
+    cfg['save_dir']     = args.save_dir
 
     device = get_device(args.device if args.device else None)
     cfg['device'] = str(device)
     os.makedirs(cfg['save_dir'], exist_ok=True)
 
+    # Ước tính thời gian (rough estimate)
+    steps_per_epoch = (cfg.get('train_subset') or 50000) // cfg['batch_size']
+    est_sec_per_epoch = steps_per_epoch * (0.05 if device.type == 'cuda' else 2.0)
+    est_total_min = cfg['num_epochs'] * est_sec_per_epoch / 60
+    amp_str = 'ON (×2 speedup)' if (cfg['use_amp'] and device.type == 'cuda') else 'OFF'
+
     print('=' * 65)
     print('  Proto-Background Attraction Probe')
     print('  Hypothesis (b): gradient từ high-norm token → prototype drift')
     print('=' * 65)
-    print(f'  Device  : {device}  ({"GPU ✓" if device.type=="cuda" else "CPU — consider enabling GPU"})')
-    print(f'  Backbone: {cfg["backbone"]}')
-    print(f'  Dataset : {cfg["dataset"]} (auto-download, resized to {cfg["img_size"]})')
-    print(f'  Epochs  : {cfg["num_epochs"]}   |   Probe every {cfg["probe_every"]} epoch(s)')
-    print(f'  Protos  : {cfg["num_proto"]} ({cfg["proto_per_cls"]} × {cfg["num_classes"]} classes)')
+    print(f'  Device      : {device}  ({"GPU ✓" if device.type=="cuda" else "CPU — consider enabling GPU"})')
+    print(f'  Backbone    : {cfg["backbone"]}')
+    print(f'  Dataset     : {cfg["dataset"]} (auto-download, resized to {cfg["img_size"]})')
+    print(f'  Train size  : {cfg.get("train_subset") or 50000:,} samples | batch {cfg["batch_size"]} | {steps_per_epoch} steps/epoch')
+    print(f'  AMP         : {amp_str}')
+    print(f'  Epochs      : {cfg["num_epochs"]}  |  Probe every {cfg["probe_every"]} epoch(s)')
+    print(f'  Protos      : {cfg["num_proto"]} ({cfg["proto_per_cls"]} × {cfg["num_classes"]} classes)')
+    print(f'  Est. time   : ~{est_total_min:.0f} min total  (rough, GPU-dependent)')
     print()
 
     # ── Data ──────────────────────────────────────────────────────────────────
@@ -551,6 +604,12 @@ def main():
         optimizer, T_max=cfg['num_epochs'], eta_min=1e-6)
     criterion = nn.CrossEntropyLoss()
 
+    # ── AMP Scaler (None nếu tắt hoặc CPU) ─────────────────────────────────────
+    scaler = None
+    if cfg.get('use_amp', True) and device.type == 'cuda':
+        scaler = torch.cuda.amp.GradScaler()
+        print('[INFO] AMP GradScaler enabled.')
+
     history = []
 
     # ── Initial probe (epoch 0, trước khi train) ──────────────────────────────
@@ -563,7 +622,7 @@ def main():
     # ── Training ──────────────────────────────────────────────────────────────
     for epoch in range(1, cfg['num_epochs'] + 1):
         loss, acc = train_one_epoch(model, train_loader, optimizer,
-                                    criterion, device, epoch)
+                                    criterion, device, epoch, scaler=scaler)
         scheduler.step()
 
         if epoch % cfg['probe_every'] == 0:
