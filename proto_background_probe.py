@@ -20,7 +20,7 @@ Metrics theo dõi mỗi epoch:
 # ─────────────────────────────────────────────
 # 0.  Dependencies
 # ─────────────────────────────────────────────
-import os, sys, math
+import os, sys, math, argparse
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -56,7 +56,7 @@ CFG = dict(
     lr_backbone    = 2e-5,         # nhỏ — tương tự fine-tune trong ProtoPFormer
     lr_addon       = 1e-3,
     lr_proto       = 1e-3,
-    device         = 'cuda' if torch.cuda.is_available() else 'cpu',
+    # device được xác định lúc runtime bởi get_device() — không đặt ở đây
 
     # Probe
     probe_every    = 1,            # probe mỗi N epoch
@@ -466,16 +466,63 @@ def train_one_epoch(model, loader, optimizer, criterion, device, epoch):
 # ─────────────────────────────────────────────
 # 7.  MAIN
 # ─────────────────────────────────────────────
+def get_device(override: str = None) -> torch.device:
+    """
+    Xác định device lúc runtime — tránh evaluate sớm khi import.
+    Thứ tự ưu tiên: CLI arg --device > biến môi trường PROBE_DEVICE > auto-detect.
+    """
+    # 1. Từ CLI / env
+    chosen = override or os.environ.get('PROBE_DEVICE', '')
+    if chosen:
+        dev = torch.device(chosen)
+        # Verify nếu yêu cầu cuda
+        if dev.type == 'cuda' and not torch.cuda.is_available():
+            print('[WARNING] --device cuda được yêu cầu nhưng torch.cuda.is_available() = False!')
+            print('          Kiểm tra: Runtime → Change runtime type → GPU trong Colab.')
+            print('          Fallback về CPU.')
+            dev = torch.device('cpu')
+        return dev
+
+    # 2. Auto-detect
+    if torch.cuda.is_available():
+        dev = torch.device('cuda')
+        props = torch.cuda.get_device_properties(0)
+        print(f'[INFO] CUDA available: {props.name}  '
+              f'({props.total_memory // 1024**2} MB VRAM)')
+    else:
+        dev = torch.device('cpu')
+        print('[WARNING] CUDA không available — chạy trên CPU sẽ rất chậm!')
+        print('          Trong Colab: Runtime → Change runtime type → GPU, sau đó Reconnect.')
+    return dev
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description='Proto-Background Attraction Probe')
+    parser.add_argument('--device',     type=str, default='',
+                        help='Force device: cuda | cpu | cuda:0 (default: auto-detect)')
+    parser.add_argument('--epochs',     type=int, default=CFG['num_epochs'])
+    parser.add_argument('--batch_size', type=int, default=CFG['batch_size'])
+    parser.add_argument('--save_dir',   type=str, default=CFG['save_dir'])
+    return parser.parse_args()
+
+
 def main():
-    cfg    = CFG
-    device = torch.device(cfg['device'])
+    args   = parse_args()
+    cfg    = CFG.copy()
+    # Override từ CLI
+    cfg['num_epochs'] = args.epochs
+    cfg['batch_size'] = args.batch_size
+    cfg['save_dir']   = args.save_dir
+
+    device = get_device(args.device if args.device else None)
+    cfg['device'] = str(device)
     os.makedirs(cfg['save_dir'], exist_ok=True)
 
     print('=' * 65)
     print('  Proto-Background Attraction Probe')
     print('  Hypothesis (b): gradient từ high-norm token → prototype drift')
     print('=' * 65)
-    print(f'  Device  : {device}')
+    print(f'  Device  : {device}  ({"GPU ✓" if device.type=="cuda" else "CPU — consider enabling GPU"})')
     print(f'  Backbone: {cfg["backbone"]}')
     print(f'  Dataset : {cfg["dataset"]} (auto-download, resized to {cfg["img_size"]})')
     print(f'  Epochs  : {cfg["num_epochs"]}   |   Probe every {cfg["probe_every"]} epoch(s)')
